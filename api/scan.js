@@ -1,41 +1,99 @@
+// Takes pasted text and asks an AI model to find dark patterns.
+// Tries several models in order, so if one is busy the next one takes over.
+
+function buildPrompt(text) {
+  return `You are a consumer-protection dark-pattern detector. Analyze the checkout/subscription/terms text below and return ONLY JSON with this exact shape:
+{"riskScore": <integer 0-100>, "siteGuess": "<what kind of service, 2-4 words>", "flags": [{"type": "<short pattern name>", "severity": "high" or "medium", "description": "<one plain-English sentence>"}], "disputeEmail": "<ready-to-send email asking to cancel and refund, mentions the specific hidden terms found, professional, under 150 words>"}
+Text to analyze:
+"""${text}"""`;
+}
+
+async function timedFetch(url, options, ms) {
+  const c = new AbortController();
+  const t = setTimeout(() => c.abort(), ms);
+  try {
+    return await fetch(url, { ...options, signal: c.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function callGemini(model, prompt) {
+  const r = await timedFetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { responseMimeType: 'application/json' }
+      })
+    },
+    9000
+  );
+  if (!r.ok) throw new Error(String(r.status));
+  const data = await r.json();
+  return data.candidates[0].content.parts.map(p => p.text || '').join('');
+}
+
+async function callGroq(model, prompt) {
+  const r = await timedFetch(
+    'https://api.groq.com/openai/v1/chat/completions',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + process.env.GROQ_API_KEY },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: 'user', content: prompt }],
+        response_format: { type: 'json_object' },
+        temperature: 0.2
+      })
+    },
+    9000
+  );
+  if (!r.ok) throw new Error(String(r.status));
+  const data = await r.json();
+  return data.choices[0].message.content;
+}
+
+function parseResult(raw) {
+  const start = raw.indexOf('{');
+  const end = raw.lastIndexOf('}');
+  const o = JSON.parse(raw.slice(start, end + 1));
+  o.riskScore = Math.max(0, Math.min(100, Math.round(Number(o.riskScore) || 0)));
+  o.siteGuess = String(o.siteGuess || 'Unknown service').slice(0, 60);
+  o.flags = Array.isArray(o.flags) ? o.flags.slice(0, 8) : [];
+  o.disputeEmail = String(o.disputeEmail || '');
+  return o;
+}
+
 module.exports = async (req, res) => {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
-
-  const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey) return res.status(500).json({ error: 'Server is missing GROQ_API_KEY' });
 
   const text = String((req.body && req.body.text) || '').trim().slice(0, 6000);
   if (!text) return res.status(400).json({ error: 'No text provided' });
 
-  const prompt = `You are a consumer-protection dark-pattern detector. Analyze the checkout/subscription text below and return ONLY valid JSON in this exact format:
-{"riskScore": <integer 0-100>, "siteGuess": "<what kind of service, 2-4 words>", "flags": [{"type": "<short pattern name>", "severity": "high" or "medium" or "low", "explanation": "<1 sentence>", "remedy": "<how to fix/avoid>"}]}
-
-Text to analyze:
-"""${text}"""`;
-
-  try {
-    const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model: 'llama-3.1-8b-instant',
-        messages: [{ role: 'user', content: prompt }],
-        response_format: { type: 'json_object' }
-      })
-    });
-
-    const data = await r.json();
-    if (!r.ok) {
-      return res.status(502).json({ error: (data.error && data.error.message) || 'AI service error' });
-    }
-
-    const raw = data.choices[0].message.content;
-    const result = JSON.parse(raw);
-    return res.status(200).json(result);
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
+  const attempts = [];
+  if (process.env.GEMINI_API_KEY) {
+    attempts.push(['gemini ' + (process.env.GEMINI_MODEL || 'gemini-2.5-flash'), callGemini, process.env.GEMINI_MODEL || 'gemini-2.5-flash']);
+    attempts.push(['gemini flash-lite', callGemini, 'gemini-2.5-flash-lite']);
   }
+  if (process.env.GROQ_API_KEY) {
+    attempts.push(['groq', callGroq, process.env.GROQ_MODEL || 'llama-3.3-70b-versatile']);
+  }
+  if (!attempts.length) {
+    return res.status(500).json({ error: 'No AI key set. Add GEMINI_API_KEY or GROQ_API_KEY in Vercel.' });
+  }
+
+  const prompt = buildPrompt(text);
+  const failures = [];
+  for (const [label, fn, model] of attempts) {
+    try {
+      const raw = await fn(model, prompt);
+      return res.status(200).json(parseResult(raw));
+    } catch (e) {
+      failures.push(label + ': ' + (e.name === 'AbortError' ? 'timeout' : e.message));
+    }
+  }
+  return res.status(502).json({ error: 'AI is busy right now, please try again. (' + failures.join('; ') + ')' });
 };
