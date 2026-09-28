@@ -45,7 +45,6 @@ async function callGroq(model, prompt) {
       body: JSON.stringify({
         model,
         messages: [{ role: 'user', content: prompt }],
-        response_format: { type: 'json_object' },
         temperature: 0.2
       })
     },
@@ -73,14 +72,16 @@ module.exports = async (req, res) => {
   const text = String((req.body && req.body.text) || '').trim().slice(0, 6000);
   if (!text) return res.status(400).json({ error: 'No text provided' });
 
-    const attempts = [];
-  const geminiModels = ['gemini-3.8-flash', 'gemini-3.5-flash', 'gemini-3.1-flash-lite'];
-  if (process.env.GEMINI_MODEL) geminiModels.unshift(process.env.GEMINI_MODEL);
-  if (process.env.GEMINI_API_KEY) {
-    for (const m of geminiModels) attempts.push(['gemini ' + m, callGemini, m]);
-  }
+      const attempts = [];
   if (process.env.GROQ_API_KEY) {
-    attempts.push(['groq', callGroq, process.env.GROQ_MODEL || 'llama-3.3-70b-versatile']);
+    const groqModels = ['openai/gpt-oss-120b', 'qwen/qwen3.6-27b', 'openai/gpt-oss-20b'];
+    if (process.env.GROQ_MODEL) groqModels.unshift(process.env.GROQ_MODEL);
+    for (const m of groqModels) attempts.push(['groq ' + m, callGroq, m]);
+  }
+  if (process.env.GEMINI_API_KEY) {
+    const geminiModels = ['gemini-3.8-flash', 'gemini-3.5-flash', 'gemini-3.1-flash-lite'];
+    if (process.env.GEMINI_MODEL) geminiModels.unshift(process.env.GEMINI_MODEL);
+    for (const m of geminiModels) attempts.push(['gemini ' + m, callGemini, m]);
   }
   if (!attempts.length) {
     return res.status(500).json({ error: 'No AI key set. Add GEMINI_API_KEY or GROQ_API_KEY in Vercel.' });
