@@ -73,10 +73,11 @@ module.exports = async (req, res) => {
   const text = String((req.body && req.body.text) || '').trim().slice(0, 6000);
   if (!text) return res.status(400).json({ error: 'No text provided' });
 
-  const attempts = [];
+    const attempts = [];
+  const geminiModels = ['gemini-3.8-flash', 'gemini-3.5-flash', 'gemini-3.1-flash-lite'];
+  if (process.env.GEMINI_MODEL) geminiModels.unshift(process.env.GEMINI_MODEL);
   if (process.env.GEMINI_API_KEY) {
-    attempts.push(['gemini ' + (process.env.GEMINI_MODEL || 'gemini-2.5-flash'), callGemini, process.env.GEMINI_MODEL || 'gemini-2.5-flash']);
-    attempts.push(['gemini flash-lite', callGemini, 'gemini-2.5-flash-lite']);
+    for (const m of geminiModels) attempts.push(['gemini ' + m, callGemini, m]);
   }
   if (process.env.GROQ_API_KEY) {
     attempts.push(['groq', callGroq, process.env.GROQ_MODEL || 'llama-3.3-70b-versatile']);
